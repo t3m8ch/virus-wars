@@ -78,11 +78,20 @@ struct InteractionState {
     path: Vec<NodeIndex>,
 }
 
+// Карта потоков: Ключ (Source) -> Значение (Куда он должен лить трафик)
+// Это "желание" игрока, оно не зависит от того, захвачен узел или нет.
+#[derive(Resource, Default)]
+struct FlowMap {
+    // node_idx -> set of target_indices
+    flows: HashMap<NodeIndex, HashSet<NodeIndex>>,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<InteractionState>()
         .init_resource::<GraphEntityMap>()
+        .init_resource::<FlowMap>()
         .add_systems(Startup, setup_game)
         .add_systems(
             Update,
@@ -290,6 +299,7 @@ fn handle_interaction(
     graph_res: Res<ComputerGraph>,
     mut nodes_q: Query<&mut GameNode>, // Читаем и пишем в узлы
     entity_map: Res<GraphEntityMap>,
+    mut flow_map: ResMut<FlowMap>,
 ) {
     let Ok((camera, cam_transform)) = camera_q.single() else {
         return;
@@ -352,51 +362,36 @@ fn handle_interaction(
         }
     }
 
-    // ПКМ: Выбор цели (Target) и построение маршрута
+    // ПКМ: Записываем приказы во FlowMap
     if buttons.just_pressed(MouseButton::Right) {
-        if let (Some(source_idx), Some(target_idx)) = (state.selected_source, hovered) {
-            if source_idx == target_idx {
-                return;
+        if !state.path.is_empty() {
+            // Проходим по всему пути: A -> B -> C -> Z
+            // A должен стрелять в B
+            // B должен стрелять в C
+            // C должен стрелять в Z
+            for window in state.path.windows(2) {
+                let current_node = window[0];
+                let next_node = window[1];
+
+                // Логика "Переключателя" (Toggle) работает хитро для цепочки.
+                // Если мы просто добавим - это ок.
+                // Если мы кликнем второй раз - мы хотим отменить ЭТУ цепочку?
+                // Для простоты реализации "стратегии": ПКМ всегда ДОБАВЛЯЕТ поток.
+                // Чтобы убрать поток, можно сделать Shift+PKM или повторный клик по конкретному звену.
+                // Давайте пока сделаем: ПКМ всегда ЗАДАЕТ поток.
+
+                let entry = flow_map.flows.entry(current_node).or_default();
+                // Если поток уже есть - не дублируем (Set сам справится)
+                // Если хотите "отмену" - нужно проверять, есть ли он там.
+
+                // Вариант с "умным тогглом":
+                // Если мы кликаем A->Z. Мы проверяем только ПЕРВОЕ звено (A->B).
+                // Если A->B уже есть, мы УДАЛЯЕМ всю цепочку (или только первое звено?).
+                // Давайте сделаем просто добавление, это интуитивнее для "наступления".
+                entry.insert(next_node);
             }
 
-            // Строим путь BFS/A*
-            let path_result = astar(
-                &graph_res.0,
-                source_idx,
-                |finish| finish == target_idx,
-                |_| 1.0, // Вес ребра 1, ищем кратчайший по хопам
-                |_| 0.0,
-            );
-
-            if let Some((_, path)) = path_result {
-                // Логика "потока":
-                // Мы идем по пути от source.
-                // Source должен стрелять в path[1].
-                // Если path[1] захвачен нами, он должен стрелять в path[2] и т.д.
-                // В данной простой реализации мы просто добавляем задание "Стрелять" для source в path[1].
-                // А логика "автоматической маршрутизации" будет работать глобально:
-                // Узлы сами решают, куда стрелять, если у них есть "глобальная цель".
-                // НО, следуя вашему ТЗ п.4: "Узел A начинает стрелять... в B. Как только B захвачен... начинает стрелять в C".
-
-                // Упростим: Мы просто говорим Source: "Атакуй соседа, который ведет к Target".
-                // А чтобы цепочка работала, мы просто будем передавать "Целеуказание" по цепочке.
-                // Но для начала реализуем прямую команду: Source -> Next hop.
-
-                if path.len() >= 2 {
-                    let next_hop = path[1];
-
-                    if let Some(&entity) = entity_map.nodes.get(&source_idx) {
-                        if let Ok(mut node) = nodes_q.get_mut(entity) {
-                            // Тоггл: если уже стреляем туда - перестаем, иначе начинаем
-                            if node.targets.contains(&next_hop) {
-                                node.targets.remove(&next_hop);
-                            } else {
-                                node.targets.insert(next_hop);
-                            }
-                        }
-                    }
-                }
-            }
+            println!("Chain command issued for path len: {}", state.path.len());
         }
     }
 }
@@ -442,8 +437,9 @@ fn spawn_packets(
     graph_res: Res<ComputerGraph>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    flow_map: Res<FlowMap>, // <--- Читаем приказы
 ) {
-    // Получим состояние всех узлов в мапу для быстрого доступа (кто чей)
+    // Кэш состояний для AI
     let node_states: HashMap<NodeIndex, (Owner, f32)> = nodes_q
         .iter()
         .map(|(n, _)| (n.index, (n.owner, n.hp)))
@@ -452,51 +448,57 @@ fn spawn_packets(
     let packet_mesh = meshes.add(Circle::new(0.015));
 
     for (mut node, transform) in nodes_q.iter_mut() {
-        // AI Logic inject: Если это Враг, он автоматически обновляет свои targets
-        if node.owner == Owner::Enemy {
-            node.targets.clear();
+        // Список целей для текущего кадра
+        let mut active_targets = HashSet::new();
+
+        // 1. Логика ИГРОКА: Смотрим в FlowMap
+        if node.owner == Owner::Player {
+            if let Some(targets) = flow_map.flows.get(&node.index) {
+                // Мы стреляем во все цели, которые записаны во FlowMap
+                // НО! Имеет смысл стрелять только в тех соседей, которые еще НЕ наши или ранены.
+                // Иначе мы просто гоняем трафик впустую.
+                // Хотя "поддержка" (лечение) тоже нужна.
+                // Оставим как есть: стреляем во всё, что приказано.
+                for &t in targets {
+                    active_targets.insert(t);
+                }
+            }
+        }
+        // 2. Логика ВРАГА (AI): Автономная (как и была)
+        else if node.owner == Owner::Enemy {
             for neighbor_idx in graph_res.0.neighbors(node.index) {
                 if let Some((neighbor_owner, neighbor_hp)) = node_states.get(&neighbor_idx) {
-                    // Атака: если сосед не враг
                     if *neighbor_owner != Owner::Enemy {
-                        node.targets.insert(neighbor_idx);
-                    }
-                    // Лечение: если сосед враг, но ранен
-                    else if *neighbor_hp < NODE_MAX_HP {
-                        node.targets.insert(neighbor_idx);
+                        active_targets.insert(neighbor_idx);
+                    } else if *neighbor_hp < NODE_MAX_HP {
+                        active_targets.insert(neighbor_idx);
                     }
                 }
             }
         }
 
-        // Логика стрельбы (общая для всех)
+        // --- Стрельба ---
+        // (Этот блок почти не изменился, только берет цели из active_targets)
         node.timer.tick(time.delta());
-        if node.timer.just_finished() && !node.targets.is_empty() && node.owner != Owner::Neutral {
-            let target_count = node.targets.len();
 
-            // Если целей много - стреляем во всех, но реже? Или просто спавним сразу кучу?
-            // По ТЗ: "скорость потока к каждому падает в 2 раза".
-            // Реализуем это через пропуск тактов или уменьшение таймера?
-            // Проще: спавним пакеты всегда, но их сила или скорость зависит от кол-ва?
-            // Давайте сделаем честно по таймеру: таймер сработал -> выпускаем пакеты.
-            // Но таймер надо замедлять?
-            // Сделаем так: таймер фиксированный. При срабатывании мы итерируемся по целям.
-            // Но чтобы соблюсти баланс "деления потока", мы можем просто уменьшать таймер реже,
-            // если целей много? Нет, лучше пусть стреляет во всех, но это стоит "ресурса"?
-            // По ТЗ проще: "Скорость потока падает". Значит кулдаун для КОНКРЕТНОГО направления увеличивается.
-            // В текущей реализации таймер один на узел.
-            // Просто выпустим пакеты во все цели.
+        if node.timer.just_finished() && !active_targets.is_empty() && node.owner != Owner::Neutral
+        {
+            let target_count = active_targets.len();
+            let cooldown_mult = target_count as f32;
 
-            for &target_idx in &node.targets {
-                // Найдем позицию цели
-                // (В реальном проекте лучше кэшировать)
+            // Сбрасываем таймер
+            node.timer.set_duration(std::time::Duration::from_secs_f32(
+                SPAWN_INTERVAL * cooldown_mult,
+            ));
+            node.timer.reset();
+
+            for &target_idx in &active_targets {
                 let target_pos = graph_res.0[target_idx].position;
-                let my_pos = transform.translation.truncate();
-                let dist = my_pos.distance(target_pos);
+                let dist = transform.translation.truncate().distance(target_pos);
 
                 let color = match node.owner {
-                    Owner::Player => Color::srgb(0.5, 0.5, 1.0), // Светло-синий пакет
-                    Owner::Enemy => Color::srgb(1.0, 0.5, 0.5),  // Розовый пакет
+                    Owner::Player => Color::srgb(0.5, 0.5, 1.0),
+                    Owner::Enemy => Color::srgb(1.0, 0.5, 0.5),
                     _ => Color::WHITE,
                 };
 
@@ -513,15 +515,6 @@ fn spawn_packets(
                     },
                 ));
             }
-
-            // Сброс таймера с учетом штрафа за количество целей?
-            // Если целей 2, то следующий выстрел должен быть через X * 2 времени?
-            // Да, давайте сделаем это.
-            let cooldown_mult = target_count as f32;
-            node.timer.set_duration(std::time::Duration::from_secs_f32(
-                SPAWN_INTERVAL * cooldown_mult,
-            ));
-            node.timer.reset();
         }
     }
 }
@@ -587,7 +580,46 @@ fn update_visuals(
     interaction: Res<InteractionState>,
     graph_res: Res<ComputerGraph>,
     entity_map: Res<GraphEntityMap>,
+    flow_map: Res<FlowMap>,
 ) {
+    let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
+    let color_path_edge = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Яркий желтый (курсор)
+    let color_flow_edge = materials.add(Color::srgb(0.0, 0.5, 1.0)); // Синий (запланированный поток)
+
+    // 1. Сброс
+    for mut mat in edges_q.iter_mut() {
+        mat.0 = color_default_edge.clone();
+    }
+
+    // 2. Подсветка ЗАПЛАНИРОВАННЫХ потоков (FlowMap)
+    // Проходим по всем записям flow_map
+    for (source, targets) in &flow_map.flows {
+        for &target in targets {
+            if let Some(edge_idx) = graph_res.0.find_edge(*source, target) {
+                if let Some(&entity) = entity_map.edges.get(&edge_idx) {
+                    if let Ok(mut mat) = edges_q.get_mut(entity) {
+                        mat.0 = color_flow_edge.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Подсветка ПУТИ под курсором (самый высокий приоритет визуала)
+    if !interaction.path.is_empty() {
+        for window in interaction.path.windows(2) {
+            let u = window[0];
+            let v = window[1];
+            if let Some(edge_idx) = graph_res.0.find_edge(u, v) {
+                if let Some(&entity) = entity_map.edges.get(&edge_idx) {
+                    if let Ok(mut mat) = edges_q.get_mut(entity) {
+                        mat.0 = color_path_edge.clone();
+                    }
+                }
+            }
+        }
+    }
+
     // 1. Сброс цветов РЕБЕР в дефолтный (серый)
     let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
     let color_path_edge = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Желтый путь
