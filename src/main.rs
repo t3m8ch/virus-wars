@@ -1,13 +1,8 @@
-use bevy::{
-    camera::ScalingMode,
-    platform::collections::{HashMap, HashSet},
-    prelude::*,
-    window::PrimaryWindow,
-};
-use petgraph::{algo::astar, graph::NodeIndex};
+use bevy::{camera::ScalingMode, platform::collections::HashSet, prelude::*};
+use petgraph::graph::NodeIndex;
 
 use crate::{
-    components::{GameNode, Owner, Packet},
+    components::{GameNode, Owner},
     resources::{ComputerGraph, FlowMap, GraphEntityMap, InteractionState},
     systems::{
         ai::ai_behavior,
