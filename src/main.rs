@@ -11,7 +11,7 @@ use crate::{
         ai::ai_behavior,
         interaction::handle_interaction,
         packet::{move_packets, spawn_packets},
-        visual::update_visuals,
+        visual::{draw_packet_trails, update_visuals},
     },
 };
 
@@ -39,6 +39,7 @@ fn main() {
                 spawn_packets,
                 move_packets,
                 update_visuals,
+                draw_packet_trails,
             )
                 .chain(),
         )

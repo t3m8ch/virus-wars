@@ -1,12 +1,14 @@
 use bevy::{
     asset::Assets,
-    color::{Color, LinearRgba, Mix},
+    color::{Alpha, Color, LinearRgba, Mix},
     ecs::{
         query::Without,
         system::{Query, Res, ResMut},
     },
+    gizmos::gizmos::Gizmos,
     input::{ButtonInput, keyboard::KeyCode},
     sprite_render::{ColorMaterial, MeshMaterial2d},
+    transform::components::Transform,
 };
 
 use crate::{
@@ -93,5 +95,12 @@ pub fn update_visuals(
                 alpha: 1.0,
             });
         }
+    }
+}
+
+pub fn draw_packet_trails(mut gizmos: Gizmos, packets: Query<(&Transform, &Packet)>) {
+    for (transform, packet) in packets.iter() {
+        let start = transform.translation.truncate();
+        gizmos.circle_2d(start, 0.03, packet.owner.color().with_alpha(0.5));
     }
 }
