@@ -26,13 +26,13 @@ pub fn update_visuals(
     keyboard: Res<ButtonInput<KeyCode>>,
 ) {
     let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
-    let color_flow_edge = materials.add(Color::srgb(0.0, 0.5, 1.0));
+    let color_flow_edge = materials.add(Color::srgb(0.0, 2.5, 10.0));
 
     let is_erasing = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
     let path_color_value = if is_erasing {
-        Color::srgb(1.0, 0.0, 0.0)
+        Color::srgb(10.0, 0.0, 0.0)
     } else {
-        Color::srgb(1.0, 1.0, 0.0)
+        Color::srgb(10.0, 10.0, 0.0)
     };
     let color_path_edge = materials.add(path_color_value);
 
@@ -71,7 +71,7 @@ pub fn update_visuals(
             let mut base_color = node.owner.color();
 
             if Some(node.index) == interaction.selected_source {
-                base_color = Color::WHITE;
+                base_color = Color::srgb(1.0, 5.0, 1.0);
             } else if interaction.path.contains(&node.index) {
                 let tint = if is_erasing {
                     Color::srgb(1.0, 0.0, 0.0)

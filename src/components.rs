@@ -11,9 +11,9 @@ pub enum Owner {
 impl Owner {
     pub fn color(&self) -> Color {
         match self {
-            Owner::Neutral => Color::srgb(0.5, 0.5, 0.5),
-            Owner::Player => Color::srgb(0.0, 0.8, 1.0),
-            Owner::Enemy => Color::srgb(1.0, 0.2, 0.2),
+            Owner::Neutral => Color::srgb(1.5, 1.5, 1.5),
+            Owner::Player => Color::srgb(0.0, 4.0, 5.0),
+            Owner::Enemy => Color::srgb(5.0, 1.0, 1.0),
         }
     }
 }

@@ -1,4 +1,7 @@
-use bevy::{camera::ScalingMode, platform::collections::HashSet, prelude::*};
+use bevy::{
+    camera::ScalingMode, core_pipeline::tonemapping::Tonemapping, platform::collections::HashSet,
+    post_process::bloom::Bloom, prelude::*,
+};
 use petgraph::graph::NodeIndex;
 
 use crate::{
@@ -56,6 +59,8 @@ fn setup_game(
             },
             ..OrthographicProjection::default_2d()
         }),
+        Tonemapping::TonyMcMapface,
+        Bloom::default(),
     ));
 
     let computer_graph = ComputerGraph::random();
