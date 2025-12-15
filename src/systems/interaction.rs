@@ -59,7 +59,6 @@ pub fn handle_interaction(
                 if let Ok(node) = nodes_q.get(entity) {
                     if node.owner == Owner::Player {
                         state.selected_source = Some(idx);
-                        println!("Source selected: {:?}", idx);
                     }
                 }
             }
@@ -104,12 +103,6 @@ pub fn handle_interaction(
                     let entry = flow_map.flows.entry(current_node).or_default();
                     entry.insert(next_node);
                 }
-            }
-
-            if is_erasing {
-                println!("Flows removed along path!");
-            } else {
-                println!("Flows added along path!");
             }
         }
     }
