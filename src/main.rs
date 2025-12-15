@@ -6,7 +6,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::{
     components::{GameNode, Owner},
-    resources::{ComputerGraph, FlowMap, GraphEntityMap, InteractionState},
+    resources::{AiTimer, ComputerGraph, FlowMap, GraphEntityMap, InteractionState},
     systems::{
         ai::ai_behavior,
         interaction::handle_interaction,
@@ -30,6 +30,7 @@ fn main() {
         .init_resource::<InteractionState>()
         .init_resource::<GraphEntityMap>()
         .init_resource::<FlowMap>()
+        .init_resource::<AiTimer>()
         .add_systems(Startup, setup_game)
         .add_systems(
             Update,

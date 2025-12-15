@@ -2,6 +2,7 @@ use bevy::{
     ecs::{entity::Entity, resource::Resource},
     math::Vec2,
     platform::collections::{HashMap, HashSet},
+    time::{Timer, TimerMode},
 };
 use petgraph::{
     Graph, Undirected,
@@ -33,6 +34,15 @@ pub struct InteractionState {
 #[derive(Resource, Default)]
 pub struct FlowMap {
     pub flows: HashMap<NodeIndex, HashSet<NodeIndex>>,
+}
+
+#[derive(Resource)]
+pub struct AiTimer(pub Timer);
+
+impl Default for AiTimer {
+    fn default() -> Self {
+        Self(Timer::from_seconds(2.0, TimerMode::Repeating))
+    }
 }
 
 impl ComputerGraph {
