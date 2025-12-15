@@ -4,33 +4,101 @@ use bevy::{
     prelude::*,
     window::PrimaryWindow,
 };
-use petgraph::{
-    Graph, Undirected,
-    algo::astar,
-    graph::{EdgeIndex, NodeIndex},
-    visit::{Bfs, EdgeRef},
-};
+use petgraph::{Graph, Undirected, algo::astar, graph::NodeIndex};
 use rand::Rng;
+
+// --- КОНФИГУРАЦИЯ БАЛАНСА ---
+const PACKET_SPEED: f32 = 2.0;
+const NODE_MAX_HP: f32 = 100.0;
+const PACKET_POWER: f32 = 10.0; // Урон или лечение за один пакет
+const SPAWN_INTERVAL: f32 = 0.5; // Секунды между выстрелами (кулдаун)
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Owner {
+    Neutral,
+    Player,
+    Enemy,
+}
+
+impl Owner {
+    fn color(&self) -> Color {
+        match self {
+            Owner::Neutral => Color::srgb(0.5, 0.5, 0.5), // Серый
+            Owner::Player => Color::srgb(0.0, 0.8, 1.0),  // Неоновый синий
+            Owner::Enemy => Color::srgb(1.0, 0.2, 0.2),   // Красный
+        }
+    }
+}
+
+// --- КОМПОНЕНТЫ ---
+
+#[derive(Component)]
+struct GameNode {
+    index: NodeIndex,
+    hp: f32,
+    owner: Owner,
+    /// Список соседей, в которые мы сейчас хотим стрелять
+    targets: HashSet<NodeIndex>,
+    /// Таймер для стрельбы
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct Packet {
+    from: NodeIndex,
+    to: NodeIndex,
+    owner: Owner,
+    progress: f32, // от 0.0 до 1.0 (процент пути)
+    edge_len: f32, // Длина ребра для расчета скорости
+}
+
+// Ресурс графа (геометрия)
+#[derive(Resource)]
+struct ComputerGraph(Graph<ComputerNode, (), Undirected>);
+
+#[derive(Clone, Copy)]
+struct ComputerNode {
+    position: Vec2,
+}
+
+#[derive(Resource, Default)]
+struct GraphEntityMap {
+    nodes: HashMap<NodeIndex, Entity>,
+    // edges: HashMap<EdgeIndex, Entity>, // Пока не используем для логики, но можно для визуала
+}
+
+#[derive(Resource, Default)]
+struct InteractionState {
+    selected_source: Option<NodeIndex>,
+    hovered_node: Option<NodeIndex>,
+}
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_resource::<InteractionState>()
         .init_resource::<GraphEntityMap>()
-        .add_systems(Startup, (setup_computer_graph, draw_computer_graph).chain())
-        .add_systems(Update, (handle_interaction, update_visuals).chain())
+        .add_systems(Startup, setup_game)
+        .add_systems(
+            Update,
+            (
+                handle_interaction, // Ввод игрока
+                ai_behavior,        // Логика врага
+                spawn_packets,      // Генерация пакетов узлами
+                move_packets,       // Движение пакетов
+                update_visuals,     // Обновление цветов и UI
+            )
+                .chain(),
+        )
         .run();
 }
-
-#[derive(Resource)]
-struct ComputerGraph(Graph<ComputerNode, (), Undirected>);
 
 impl ComputerGraph {
     fn random() -> Self {
         const NODE_COUNT: usize = 30;
         const ATTEMPTS: usize = 20;
         const MIN_DIST: f32 = 0.2;
-        const CONNECT_DIST: f32 = 0.4;
+        const CONNECT_DIST: f32 = 0.45;
 
         let mut graph = Graph::new_undirected();
         let mut rng = rand::rng();
@@ -40,42 +108,36 @@ impl ComputerGraph {
             if positions.len() >= NODE_COUNT {
                 break;
             }
-
-            let candidate = Vec2::new(rng.random_range(-0.9..0.9), rng.random_range(-0.9..0.9));
+            // Чуть уменьшил границы, чтобы интерфейс не перекрывал
+            let candidate = Vec2::new(rng.random_range(-0.8..0.8), rng.random_range(-0.8..0.8));
 
             for pos in &positions {
                 if pos.distance(candidate) < MIN_DIST {
                     continue 'outer;
                 }
             }
-
             positions.push(candidate);
         }
 
         let node_indices: Vec<NodeIndex> = positions
             .iter()
-            .map(|&pos| {
-                graph.add_node(ComputerNode {
-                    position: pos,
-                    color: Color::WHITE,
-                })
-            })
+            .map(|&pos| graph.add_node(ComputerNode { position: pos }))
             .collect();
 
+        // Соединяем близкие
         for i in 0..node_indices.len() {
             for j in (i + 1)..node_indices.len() {
                 let idx_a = node_indices[i];
                 let idx_b = node_indices[j];
-
                 let pos_a = graph[idx_a].position;
                 let pos_b = graph[idx_b].position;
-
                 if pos_a.distance(pos_b) < CONNECT_DIST {
                     graph.add_edge(idx_a, idx_b, ());
                 }
             }
         }
 
+        // Гарантируем связность (как в вашем коде)
         loop {
             let mut components: Vec<Vec<NodeIndex>> = Vec::new();
             let mut visited = HashSet::new();
@@ -83,7 +145,7 @@ impl ComputerGraph {
             for &node in &node_indices {
                 if !visited.contains(&node) {
                     let mut component = Vec::new();
-                    let mut bfs = Bfs::new(&graph, node);
+                    let mut bfs = petgraph::visit::Bfs::new(&graph, node);
                     while let Some(visited_node) = bfs.next(&graph) {
                         visited.insert(visited_node);
                         component.push(visited_node);
@@ -98,7 +160,6 @@ impl ComputerGraph {
 
             let mut min_dist = f32::MAX;
             let mut best_edge = None;
-
             let island_a = &components[0];
 
             for island_b in components.iter().skip(1) {
@@ -112,136 +173,113 @@ impl ComputerGraph {
                     }
                 }
             }
-
             if let Some((u, v)) = best_edge {
                 graph.add_edge(u, v, ());
             } else {
                 break;
             }
         }
-
         Self(graph)
     }
 }
 
-#[derive(Resource, Default)]
-struct GraphEntityMap {
-    nodes: HashMap<NodeIndex, Entity>,
-    edges: HashMap<EdgeIndex, Entity>,
-}
-
-#[derive(Resource, Default)]
-struct InteractionState {
-    start_node: Option<NodeIndex>,
-    hovered_node: Option<NodeIndex>,
-    path: Vec<NodeIndex>,
-}
-
-#[derive(Clone, Copy)]
-struct ComputerNode {
-    position: Vec2,
-    color: Color,
-}
-
-#[derive(Component)]
-struct GraphMaterialHandles {
-    normal: Handle<ColorMaterial>,
-    highlight: Handle<ColorMaterial>,
-    selected: Handle<ColorMaterial>,
-}
-
-impl ComputerNode {
-    fn new(position: Vec2, color: Color) -> Self {
-        ComputerNode { position, color }
-    }
-}
-
-fn setup_computer_graph(mut commands: Commands) {
+fn setup_game(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut entity_map: ResMut<GraphEntityMap>,
+) {
+    // Камера
     commands.spawn((
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: 2.0,
+                viewport_height: 2.5,
             },
             ..OrthographicProjection::default_2d()
         }),
     ));
 
-    commands.insert_resource(ComputerGraph::random());
-}
+    // Генерируем граф
+    let computer_graph = ComputerGraph::random();
+    let graph = &computer_graph.0;
 
-fn draw_computer_graph(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    graph: Res<ComputerGraph>,
-    mut entity_map: ResMut<GraphEntityMap>,
-) {
-    // Подготавливаем материалы (цвета)
-    let node_color_normal = materials.add(Color::WHITE);
-    let node_color_selected = materials.add(Color::srgb(0.0, 1.0, 0.0)); // Зеленый (старт)
-    let node_color_highlight = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Желтый (путь)
+    // Определяем стартовые позиции
+    // 0 - Игрок, Последний - Враг (для простоты)
+    let player_start_idx = NodeIndex::new(0);
+    let enemy_start_idx = NodeIndex::new(graph.node_count() - 1);
 
-    let edge_color_normal = materials.add(Color::srgb(1.0, 0.0, 0.0)); // Красный
-    let edge_color_highlight = materials.add(Color::srgb(0.0, 0.8, 1.0)); // Голубой (путь)
+    let mesh_circle = meshes.add(Circle::new(0.06)); // Чуть больше узлы
+    let mesh_edge = meshes.add(Rectangle::new(1.0, 0.02)); // Пропорции потом изменим трансформом
 
-    let mesh_circle = meshes.add(Circle::new(0.03));
+    // Спавним узлы
+    for node_idx in graph.node_indices() {
+        let node_data = graph[node_idx];
 
-    // Рисуем узлы
-    for node_idx in graph.0.node_indices() {
-        let node = graph.0[node_idx];
+        // Начальное владение
+        let (owner, hp) = if node_idx == player_start_idx {
+            (Owner::Player, 100.0)
+        } else if node_idx == enemy_start_idx {
+            (Owner::Enemy, 100.0)
+        } else {
+            (Owner::Neutral, 50.0) // Нейтралам дадим 50 HP
+        };
+
+        let color = owner.color();
+        let material = materials.add(ColorMaterial::from(color));
+
         let entity = commands
             .spawn((
                 Mesh2d(mesh_circle.clone()),
-                MeshMaterial2d(node_color_normal.clone()),
-                Transform::from_xyz(node.position.x, node.position.y, 1.0), // Z=1 (поверх ребер)
-                // Сохраняем handles материалов в компоненте, чтобы не искать их каждый кадр
-                GraphMaterialHandles {
-                    normal: node_color_normal.clone(),
-                    highlight: node_color_highlight.clone(),
-                    selected: node_color_selected.clone(),
+                MeshMaterial2d(material),
+                Transform::from_xyz(node_data.position.x, node_data.position.y, 1.0),
+                // Логический компонент узла
+                GameNode {
+                    index: node_idx,
+                    hp,
+                    owner,
+                    targets: HashSet::new(),
+                    timer: Timer::from_seconds(SPAWN_INTERVAL, TimerMode::Repeating),
                 },
             ))
             .id();
+
         entity_map.nodes.insert(node_idx, entity);
     }
 
-    // Рисуем ребра
-    for edge_idx in graph.0.edge_indices() {
-        let (u, v) = graph.0.edge_endpoints(edge_idx).unwrap();
-        let pos_a = graph.0[u].position;
-        let pos_b = graph.0[v].position;
+    // Спавним ребра (чисто визуал + связь)
+    let edge_color = materials.add(Color::srgb(0.2, 0.2, 0.2));
+    for edge_idx in graph.edge_indices() {
+        let (u, v) = graph.edge_endpoints(edge_idx).unwrap();
+        let pos_a = graph[u].position;
+        let pos_b = graph[v].position;
 
         let diff = pos_b - pos_a;
         let len = diff.length();
         let pos = (pos_a + pos_b) / 2.0;
         let angle = diff.y.atan2(diff.x);
 
-        // В Bevy 0.17+ Mesh2d заменил MaterialMesh2dBundle
-        let rect_mesh = meshes.add(Rectangle::new(len, 0.01));
-
-        let entity = commands
-            .spawn((
-                Mesh2d(rect_mesh),
-                MeshMaterial2d(edge_color_normal.clone()),
-                Transform::from_xyz(pos.x, pos.y, 0.0).with_rotation(Quat::from_rotation_z(angle)),
-                GraphMaterialHandles {
-                    normal: edge_color_normal.clone(),
-                    highlight: edge_color_highlight.clone(),
-                    selected: edge_color_highlight.clone(),
-                },
-            ))
-            .id();
-        entity_map.edges.insert(edge_idx, entity);
+        commands.spawn((
+            Mesh2d(mesh_edge.clone()),
+            MeshMaterial2d(edge_color.clone()),
+            Transform::from_xyz(pos.x, pos.y, 0.0)
+                .with_rotation(Quat::from_rotation_z(angle))
+                .with_scale(Vec3::new(len, 1.0, 1.0)),
+        ));
     }
+
+    commands.insert_resource(computer_graph);
 }
 
+// 4. Управление (Игрок)
 fn handle_interaction(
     window_q: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
     mut state: ResMut<InteractionState>,
-    graph: Res<ComputerGraph>,
     buttons: Res<ButtonInput<MouseButton>>,
+    graph_res: Res<ComputerGraph>,
+    mut nodes_q: Query<&mut GameNode>, // Читаем и пишем в узлы
+    entity_map: Res<GraphEntityMap>,
 ) {
     let Ok((camera, cam_transform)) = camera_q.single() else {
         return;
@@ -249,106 +287,303 @@ fn handle_interaction(
     let Ok(window) = window_q.single() else {
         return;
     };
-
     let Some(cursor_pos) = window.cursor_position() else {
         return;
     };
-
     let Ok(ray) = camera.viewport_to_world(cam_transform, cursor_pos) else {
         return;
     };
     let world_pos = ray.origin.truncate();
 
-    let mut closest_node = None;
-    let mut min_dist = 0.05;
+    // Hit testing (поиск ближайшего узла под курсором)
+    let mut hovered = None;
+    let mut min_dist = 0.1; // Радиус клика
 
-    for node_idx in graph.0.node_indices() {
-        let node_pos = graph.0[node_idx].position;
-        let dist = node_pos.distance(world_pos);
+    for node_idx in graph_res.0.node_indices() {
+        let pos = graph_res.0[node_idx].position;
+        let dist = pos.distance(world_pos);
         if dist < min_dist {
             min_dist = dist;
-            closest_node = Some(node_idx);
+            hovered = Some(node_idx);
         }
     }
+    state.hovered_node = hovered;
 
-    state.hovered_node = closest_node;
-
+    // ЛКМ: Выбор своего узла (источник)
     if buttons.just_pressed(MouseButton::Left) {
-        if let Some(node) = closest_node {
-            state.start_node = Some(node);
-            state.path.clear();
+        if let Some(idx) = hovered {
+            // Проверяем, что это узел игрока
+            if let Some(&entity) = entity_map.nodes.get(&idx) {
+                if let Ok(node) = nodes_q.get(entity) {
+                    if node.owner == Owner::Player {
+                        state.selected_source = Some(idx);
+                        println!("Source selected: {:?}", idx);
+                    }
+                }
+            }
         } else {
-            state.start_node = None;
-            state.path.clear();
+            state.selected_source = None; // Клик в пустоту - сброс
         }
     }
 
-    if let (Some(start), Some(end)) = (state.start_node, state.hovered_node) {
-        if start != end {
+    // ПКМ: Выбор цели (Target) и построение маршрута
+    if buttons.just_pressed(MouseButton::Right) {
+        if let (Some(source_idx), Some(target_idx)) = (state.selected_source, hovered) {
+            if source_idx == target_idx {
+                return;
+            }
+
+            // Строим путь BFS/A*
             let path_result = astar(
-                &graph.0,
-                start,
-                |finish| finish == end,
-                |e| {
-                    let (u, v) = graph.0.edge_endpoints(e.id()).unwrap();
-                    graph.0[u].position.distance(graph.0[v].position)
-                },
+                &graph_res.0,
+                source_idx,
+                |finish| finish == target_idx,
+                |_| 1.0, // Вес ребра 1, ищем кратчайший по хопам
                 |_| 0.0,
             );
 
             if let Some((_, path)) = path_result {
-                state.path = path;
-            } else {
-                state.path.clear();
+                // Логика "потока":
+                // Мы идем по пути от source.
+                // Source должен стрелять в path[1].
+                // Если path[1] захвачен нами, он должен стрелять в path[2] и т.д.
+                // В данной простой реализации мы просто добавляем задание "Стрелять" для source в path[1].
+                // А логика "автоматической маршрутизации" будет работать глобально:
+                // Узлы сами решают, куда стрелять, если у них есть "глобальная цель".
+                // НО, следуя вашему ТЗ п.4: "Узел A начинает стрелять... в B. Как только B захвачен... начинает стрелять в C".
+
+                // Упростим: Мы просто говорим Source: "Атакуй соседа, который ведет к Target".
+                // А чтобы цепочка работала, мы просто будем передавать "Целеуказание" по цепочке.
+                // Но для начала реализуем прямую команду: Source -> Next hop.
+
+                if path.len() >= 2 {
+                    let next_hop = path[1];
+
+                    if let Some(&entity) = entity_map.nodes.get(&source_idx) {
+                        if let Ok(mut node) = nodes_q.get_mut(entity) {
+                            // Тоггл: если уже стреляем туда - перестаем, иначе начинаем
+                            if node.targets.contains(&next_hop) {
+                                node.targets.remove(&next_hop);
+                            } else {
+                                node.targets.insert(next_hop);
+                            }
+                        }
+                    }
+                }
             }
-        } else {
-            state.path.clear();
+        }
+    }
+}
+
+// 6. Противник (AI) - Жадный Рой
+fn ai_behavior(nodes_q: Query<&mut GameNode>, graph_res: Res<ComputerGraph>) {
+    // Враг пересчитывает логику не каждый кадр, но для простоты здесь сделаем каждый.
+    // Итерируемся по всем узлам
+    // Нельзя одновременно итерироваться мутабельно и читать граф соседей внутри запроса без unsafe или сбора данных.
+    // Соберем данные для AI команд.
+
+    let mut commands = Vec::new();
+
+    for node in nodes_q.iter() {
+        if node.owner == Owner::Enemy {
+            // Смотрим соседей
+            for _ in graph_res.0.neighbors(node.index) {
+                // Нам нужно узнать владельца соседа. Это сложно в одном query.
+                // Придется сделать поиск владельца соседа.
+                // Оптимизация: хранить владельца в NodeState, а доступ через EntityMap медленный?
+                // Сделаем "хак": пройдемся по nodes_q второй раз внутри нельзя.
+                // Поэтому разобьем на два прохода: чтение состояний -> принятие решений.
+                commands.push(node.index);
+            }
+        }
+    }
+
+    // Это место неоптимально для реального ECS, но для Bevy и малого графа сойдет:
+    // Мы не можем легко получить компонент соседа, зная его NodeIndex, без мапы.
+    // Но у нас есть логика "Жадный рой":
+    // "Если у красного узла есть нейтральный или вражеский сосед — он начинает спамить в него".
+
+    // В Bevy проще сделать так: AI просто "включает" стрельбу во ВСЕХ соседей, которые не Красные и не полные HP.
+}
+
+// Улучшенная версия AI (без сложных запросов)
+// AI просто всегда атакует всех соседей, которые не его цвета.
+// И лечит своих, если они ранены.
+fn spawn_packets(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut nodes_q: Query<(&mut GameNode, &Transform)>,
+    graph_res: Res<ComputerGraph>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    // Получим состояние всех узлов в мапу для быстрого доступа (кто чей)
+    let node_states: HashMap<NodeIndex, (Owner, f32)> = nodes_q
+        .iter()
+        .map(|(n, _)| (n.index, (n.owner, n.hp)))
+        .collect();
+
+    let packet_mesh = meshes.add(Circle::new(0.015));
+
+    for (mut node, transform) in nodes_q.iter_mut() {
+        // AI Logic inject: Если это Враг, он автоматически обновляет свои targets
+        if node.owner == Owner::Enemy {
+            node.targets.clear();
+            for neighbor_idx in graph_res.0.neighbors(node.index) {
+                if let Some((neighbor_owner, neighbor_hp)) = node_states.get(&neighbor_idx) {
+                    // Атака: если сосед не враг
+                    if *neighbor_owner != Owner::Enemy {
+                        node.targets.insert(neighbor_idx);
+                    }
+                    // Лечение: если сосед враг, но ранен
+                    else if *neighbor_hp < NODE_MAX_HP {
+                        node.targets.insert(neighbor_idx);
+                    }
+                }
+            }
+        }
+
+        // Логика стрельбы (общая для всех)
+        node.timer.tick(time.delta());
+        if node.timer.just_finished() && !node.targets.is_empty() && node.owner != Owner::Neutral {
+            let target_count = node.targets.len();
+
+            // Если целей много - стреляем во всех, но реже? Или просто спавним сразу кучу?
+            // По ТЗ: "скорость потока к каждому падает в 2 раза".
+            // Реализуем это через пропуск тактов или уменьшение таймера?
+            // Проще: спавним пакеты всегда, но их сила или скорость зависит от кол-ва?
+            // Давайте сделаем честно по таймеру: таймер сработал -> выпускаем пакеты.
+            // Но таймер надо замедлять?
+            // Сделаем так: таймер фиксированный. При срабатывании мы итерируемся по целям.
+            // Но чтобы соблюсти баланс "деления потока", мы можем просто уменьшать таймер реже,
+            // если целей много? Нет, лучше пусть стреляет во всех, но это стоит "ресурса"?
+            // По ТЗ проще: "Скорость потока падает". Значит кулдаун для КОНКРЕТНОГО направления увеличивается.
+            // В текущей реализации таймер один на узел.
+            // Просто выпустим пакеты во все цели.
+
+            for &target_idx in &node.targets {
+                // Найдем позицию цели
+                // (В реальном проекте лучше кэшировать)
+                let target_pos = graph_res.0[target_idx].position;
+                let my_pos = transform.translation.truncate();
+                let dist = my_pos.distance(target_pos);
+
+                let color = match node.owner {
+                    Owner::Player => Color::srgb(0.5, 0.5, 1.0), // Светло-синий пакет
+                    Owner::Enemy => Color::srgb(1.0, 0.5, 0.5),  // Розовый пакет
+                    _ => Color::WHITE,
+                };
+
+                commands.spawn((
+                    Mesh2d(packet_mesh.clone()),
+                    MeshMaterial2d(materials.add(ColorMaterial::from(color))),
+                    Transform::from_translation(transform.translation),
+                    Packet {
+                        from: node.index,
+                        to: target_idx,
+                        owner: node.owner,
+                        progress: 0.0,
+                        edge_len: dist,
+                    },
+                ));
+            }
+
+            // Сброс таймера с учетом штрафа за количество целей?
+            // Если целей 2, то следующий выстрел должен быть через X * 2 времени?
+            // Да, давайте сделаем это.
+            let cooldown_mult = target_count as f32;
+            node.timer.set_duration(std::time::Duration::from_secs_f32(
+                SPAWN_INTERVAL * cooldown_mult,
+            ));
+            node.timer.reset();
+        }
+    }
+}
+
+// 3. Физика пакетов и коллизии
+fn move_packets(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut packets_q: Query<(Entity, &mut Packet, &mut Transform)>,
+    mut nodes_q: Query<&mut GameNode>,
+    graph_res: Res<ComputerGraph>,
+    entity_map: Res<GraphEntityMap>,
+) {
+    for (packet_entity, mut packet, mut transform) in packets_q.iter_mut() {
+        // Движение
+        let speed = PACKET_SPEED / packet.edge_len; // Нормализуем скорость, чтобы была const м/с
+        packet.progress += speed * time.delta_secs();
+
+        let start_pos = graph_res.0[packet.from].position;
+        let end_pos = graph_res.0[packet.to].position;
+
+        let current_pos = start_pos.lerp(end_pos, packet.progress);
+        transform.translation.x = current_pos.x;
+        transform.translation.y = current_pos.y;
+
+        // Попадание
+        if packet.progress >= 1.0 {
+            // Удаляем пакет
+            commands.entity(packet_entity).despawn();
+
+            // Наносим эффект узлу
+            if let Some(&target_entity) = entity_map.nodes.get(&packet.to) {
+                if let Ok(mut target_node) = nodes_q.get_mut(target_entity) {
+                    process_hit(&mut target_node, packet.owner);
+                }
+            }
+        }
+    }
+}
+
+fn process_hit(node: &mut GameNode, packet_owner: Owner) {
+    if node.owner == packet_owner {
+        // Лечение
+        node.hp = (node.hp + PACKET_POWER).min(NODE_MAX_HP);
+    } else {
+        // Урон
+        node.hp -= PACKET_POWER;
+        if node.hp <= 0.0 {
+            // Захват!
+            node.owner = packet_owner;
+            node.hp = 10.0; // Стартовое HP после захвата
+            node.targets.clear(); // Сбрасываем старые приказы
+            // Здесь можно добавить авто-продолжение пути, если реализовывать "Потоки" полностью
         }
     }
 }
 
 fn update_visuals(
-    state: Res<InteractionState>,
-    graph: Res<ComputerGraph>,
-    entity_map: Res<GraphEntityMap>,
-    mut materials_q: Query<(&mut MeshMaterial2d<ColorMaterial>, &GraphMaterialHandles)>,
+    nodes_q: Query<(&GameNode, &MeshMaterial2d<ColorMaterial>)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    interaction: Res<InteractionState>,
 ) {
-    for (mut mat, handles) in materials_q.iter_mut() {
-        mat.0 = handles.normal.clone();
-    }
+    for (node, mat_handle) in nodes_q.iter() {
+        // Получаем материал
+        if let Some(material) = materials.get_mut(mat_handle) {
+            let mut base_color = node.owner.color();
 
-    if let Some(start) = state.start_node {
-        if let Some(&entity) = entity_map.nodes.get(&start) {
-            if let Ok((mut mat, handles)) = materials_q.get_mut(entity) {
-                mat.0 = handles.selected.clone();
+            // Если выбран (источник) - подсветим ярче или белым ободком (тут просто меняем оттенок)
+            if Some(node.index) == interaction.selected_source {
+                base_color = base_color.mix(&Color::WHITE, 0.5);
             }
-        }
-    }
-
-    if !state.path.is_empty() {
-        for &node_idx in &state.path {
-            if Some(node_idx) == state.start_node {
-                continue;
+            // Если под мышкой
+            if Some(node.index) == interaction.hovered_node {
+                base_color = base_color.mix(&Color::srgb(1.0, 1.0, 0.0), 0.3);
             }
 
-            if let Some(&entity) = entity_map.nodes.get(&node_idx) {
-                if let Ok((mut mat, handles)) = materials_q.get_mut(entity) {
-                    mat.0 = handles.highlight.clone();
-                }
-            }
-        }
-
-        for window in state.path.windows(2) {
-            let u = window[0];
-            let v = window[1];
-
-            if let Some(edge_idx) = graph.0.find_edge(u, v) {
-                if let Some(&entity) = entity_map.edges.get(&edge_idx) {
-                    if let Ok((mut mat, handles)) = materials_q.get_mut(entity) {
-                        mat.0 = handles.highlight.clone();
-                    }
-                }
-            }
+            // Отображение HP через прозрачность или насыщенность?
+            // Лучше через размер, но размер менять сложнее (надо Transform).
+            // Давайте затемнять, если мало HP.
+            let hp_factor = 0.3 + 0.7 * (node.hp / NODE_MAX_HP);
+            // Bevy Color ops
+            let final_color = LinearRgba::from(base_color);
+            material.color = Color::LinearRgba(LinearRgba {
+                red: final_color.red * hp_factor,
+                green: final_color.green * hp_factor,
+                blue: final_color.blue * hp_factor,
+                alpha: 1.0,
+            });
         }
     }
 }
