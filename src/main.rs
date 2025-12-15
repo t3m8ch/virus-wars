@@ -4,14 +4,18 @@ use bevy::{
     prelude::*,
     window::PrimaryWindow,
 };
-use petgraph::{Graph, Undirected, algo::astar, graph::NodeIndex};
+use petgraph::{
+    Graph, Undirected,
+    algo::astar,
+    graph::{EdgeIndex, NodeIndex},
+};
 use rand::Rng;
 
 // --- КОНФИГУРАЦИЯ БАЛАНСА ---
-const PACKET_SPEED: f32 = 2.0;
+const PACKET_SPEED: f32 = 1.0;
 const NODE_MAX_HP: f32 = 100.0;
-const PACKET_POWER: f32 = 10.0; // Урон или лечение за один пакет
-const SPAWN_INTERVAL: f32 = 0.5; // Секунды между выстрелами (кулдаун)
+const PACKET_POWER: f32 = 1.0; // Урон или лечение за один пакет
+const SPAWN_INTERVAL: f32 = 0.1; // Секунды между выстрелами (кулдаун)
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Owner {
@@ -64,13 +68,14 @@ struct ComputerNode {
 #[derive(Resource, Default)]
 struct GraphEntityMap {
     nodes: HashMap<NodeIndex, Entity>,
-    // edges: HashMap<EdgeIndex, Entity>, // Пока не используем для логики, но можно для визуала
+    edges: HashMap<EdgeIndex, Entity>,
 }
 
 #[derive(Resource, Default)]
 struct InteractionState {
     selected_source: Option<NodeIndex>,
     hovered_node: Option<NodeIndex>,
+    path: Vec<NodeIndex>,
 }
 
 fn main() {
@@ -248,7 +253,8 @@ fn setup_game(
     }
 
     // Спавним ребра (чисто визуал + связь)
-    let edge_color = materials.add(Color::srgb(0.2, 0.2, 0.2));
+    let edge_color = materials.add(Color::srgb(0.2, 0.2, 0.2)); // Темно-серый по умолчанию
+
     for edge_idx in graph.edge_indices() {
         let (u, v) = graph.edge_endpoints(edge_idx).unwrap();
         let pos_a = graph[u].position;
@@ -259,13 +265,17 @@ fn setup_game(
         let pos = (pos_a + pos_b) / 2.0;
         let angle = diff.y.atan2(diff.x);
 
-        commands.spawn((
-            Mesh2d(mesh_edge.clone()),
-            MeshMaterial2d(edge_color.clone()),
-            Transform::from_xyz(pos.x, pos.y, 0.0)
-                .with_rotation(Quat::from_rotation_z(angle))
-                .with_scale(Vec3::new(len, 1.0, 1.0)),
-        ));
+        let entity = commands
+            .spawn((
+                Mesh2d(mesh_edge.clone()),
+                MeshMaterial2d(edge_color.clone()),
+                Transform::from_xyz(pos.x, pos.y, 0.0)
+                    .with_rotation(Quat::from_rotation_z(angle))
+                    .with_scale(Vec3::new(len, 1.0, 1.0)),
+            ))
+            .id();
+
+        entity_map.edges.insert(edge_idx, entity);
     }
 
     commands.insert_resource(computer_graph);
@@ -323,6 +333,22 @@ fn handle_interaction(
             }
         } else {
             state.selected_source = None; // Клик в пустоту - сброс
+        }
+    }
+
+    state.path.clear(); // Сбрасываем старый путь
+    if let (Some(source), Some(target)) = (state.selected_source, state.hovered_node) {
+        if source != target {
+            let path_result = astar(
+                &graph_res.0,
+                source,
+                |finish| finish == target,
+                |_| 1.0,
+                |_| 0.0,
+            );
+            if let Some((_, path)) = path_result {
+                state.path = path;
+            }
         }
     }
 
@@ -555,29 +581,53 @@ fn process_hit(node: &mut GameNode, packet_owner: Owner) {
 
 fn update_visuals(
     nodes_q: Query<(&GameNode, &MeshMaterial2d<ColorMaterial>)>,
+    // ИСПРАВЛЕНИЕ: Добавили Without<Packet>, чтобы не перекрашивать снаряды в цвет ребер
+    mut edges_q: Query<&mut MeshMaterial2d<ColorMaterial>, (Without<GameNode>, Without<Packet>)>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     interaction: Res<InteractionState>,
+    graph_res: Res<ComputerGraph>,
+    entity_map: Res<GraphEntityMap>,
 ) {
+    // 1. Сброс цветов РЕБЕР в дефолтный (серый)
+    let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
+    let color_path_edge = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Желтый путь
+
+    for mut mat in edges_q.iter_mut() {
+        mat.0 = color_default_edge.clone();
+    }
+
+    // 2. Подсветка РЕБЕР пути
+    if !interaction.path.is_empty() {
+        for window in interaction.path.windows(2) {
+            let u = window[0];
+            let v = window[1];
+            if let Some(edge_idx) = graph_res.0.find_edge(u, v) {
+                if let Some(&entity) = entity_map.edges.get(&edge_idx) {
+                    // Теперь это безопасно меняет только ребра
+                    if let Ok(mut mat) = edges_q.get_mut(entity) {
+                        mat.0 = color_path_edge.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Обновление цветов УЗЛОВ
     for (node, mat_handle) in nodes_q.iter() {
-        // Получаем материал
         if let Some(material) = materials.get_mut(mat_handle) {
             let mut base_color = node.owner.color();
 
-            // Если выбран (источник) - подсветим ярче или белым ободком (тут просто меняем оттенок)
             if Some(node.index) == interaction.selected_source {
-                base_color = base_color.mix(&Color::WHITE, 0.5);
-            }
-            // Если под мышкой
-            if Some(node.index) == interaction.hovered_node {
+                base_color = Color::WHITE;
+            } else if interaction.path.contains(&node.index) {
+                base_color = base_color.mix(&Color::srgb(1.0, 1.0, 0.0), 0.6);
+            } else if Some(node.index) == interaction.hovered_node {
                 base_color = base_color.mix(&Color::srgb(1.0, 1.0, 0.0), 0.3);
             }
 
-            // Отображение HP через прозрачность или насыщенность?
-            // Лучше через размер, но размер менять сложнее (надо Transform).
-            // Давайте затемнять, если мало HP.
             let hp_factor = 0.3 + 0.7 * (node.hp / NODE_MAX_HP);
-            // Bevy Color ops
             let final_color = LinearRgba::from(base_color);
+
             material.color = Color::LinearRgba(LinearRgba {
                 red: final_color.red * hp_factor,
                 green: final_color.green * hp_factor,
