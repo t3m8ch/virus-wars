@@ -295,7 +295,8 @@ fn handle_interaction(
     window_q: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
     mut state: ResMut<InteractionState>,
-    buttons: Res<ButtonInput<MouseButton>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
     graph_res: Res<ComputerGraph>,
     mut nodes_q: Query<&mut GameNode>, // Читаем и пишем в узлы
     entity_map: Res<GraphEntityMap>,
@@ -330,7 +331,7 @@ fn handle_interaction(
     state.hovered_node = hovered;
 
     // ЛКМ: Выбор своего узла (источник)
-    if buttons.just_pressed(MouseButton::Left) {
+    if mouse_buttons.just_pressed(MouseButton::Left) {
         if let Some(idx) = hovered {
             // Проверяем, что это узел игрока
             if let Some(&entity) = entity_map.nodes.get(&idx) {
@@ -362,36 +363,37 @@ fn handle_interaction(
         }
     }
 
-    // ПКМ: Записываем приказы во FlowMap
-    if buttons.just_pressed(MouseButton::Right) {
+    // ПКМ: Управление потоками (ДОБАВИЛИ SHIFT)
+    if mouse_buttons.just_pressed(MouseButton::Right) {
         if !state.path.is_empty() {
-            // Проходим по всему пути: A -> B -> C -> Z
-            // A должен стрелять в B
-            // B должен стрелять в C
-            // C должен стрелять в Z
+            let is_erasing =
+                keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+
             for window in state.path.windows(2) {
                 let current_node = window[0];
                 let next_node = window[1];
 
-                // Логика "Переключателя" (Toggle) работает хитро для цепочки.
-                // Если мы просто добавим - это ок.
-                // Если мы кликнем второй раз - мы хотим отменить ЭТУ цепочку?
-                // Для простоты реализации "стратегии": ПКМ всегда ДОБАВЛЯЕТ поток.
-                // Чтобы убрать поток, можно сделать Shift+PKM или повторный клик по конкретному звену.
-                // Давайте пока сделаем: ПКМ всегда ЗАДАЕТ поток.
-
-                let entry = flow_map.flows.entry(current_node).or_default();
-                // Если поток уже есть - не дублируем (Set сам справится)
-                // Если хотите "отмену" - нужно проверять, есть ли он там.
-
-                // Вариант с "умным тогглом":
-                // Если мы кликаем A->Z. Мы проверяем только ПЕРВОЕ звено (A->B).
-                // Если A->B уже есть, мы УДАЛЯЕМ всю цепочку (или только первое звено?).
-                // Давайте сделаем просто добавление, это интуитивнее для "наступления".
-                entry.insert(next_node);
+                if is_erasing {
+                    // РЕЖИМ УДАЛЕНИЯ: Убираем цель из списка
+                    if let Some(targets) = flow_map.flows.get_mut(&current_node) {
+                        targets.remove(&next_node);
+                        // Если список пуст, можно удалить и ключ, чтобы не засорять память
+                        if targets.is_empty() {
+                            flow_map.flows.remove(&current_node);
+                        }
+                    }
+                } else {
+                    // РЕЖИМ ДОБАВЛЕНИЯ (Стандартный)
+                    let entry = flow_map.flows.entry(current_node).or_default();
+                    entry.insert(next_node);
+                }
             }
 
-            println!("Chain command issued for path len: {}", state.path.len());
+            if is_erasing {
+                println!("Flows removed along path!");
+            } else {
+                println!("Flows added along path!");
+            }
         }
     }
 }
@@ -574,25 +576,32 @@ fn process_hit(node: &mut GameNode, packet_owner: Owner) {
 
 fn update_visuals(
     nodes_q: Query<(&GameNode, &MeshMaterial2d<ColorMaterial>)>,
-    // ИСПРАВЛЕНИЕ: Добавили Without<Packet>, чтобы не перекрашивать снаряды в цвет ребер
     mut edges_q: Query<&mut MeshMaterial2d<ColorMaterial>, (Without<GameNode>, Without<Packet>)>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     interaction: Res<InteractionState>,
     graph_res: Res<ComputerGraph>,
     entity_map: Res<GraphEntityMap>,
     flow_map: Res<FlowMap>,
+    keyboard: Res<ButtonInput<KeyCode>>, // <--- ДОБАВИЛИ КЛАВИАТУРУ
 ) {
     let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
-    let color_path_edge = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Яркий желтый (курсор)
-    let color_flow_edge = materials.add(Color::srgb(0.0, 0.5, 1.0)); // Синий (запланированный поток)
+    let color_flow_edge = materials.add(Color::srgb(0.0, 0.5, 1.0)); // Синий (активный поток)
 
-    // 1. Сброс
+    // Определяем цвет курсора (пути)
+    let is_erasing = keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+    let path_color_value = if is_erasing {
+        Color::srgb(1.0, 0.0, 0.0) // Красный при удалении
+    } else {
+        Color::srgb(1.0, 1.0, 0.0) // Желтый при добавлении
+    };
+    let color_path_edge = materials.add(path_color_value);
+
+    // 1. Сброс (без изменений)
     for mut mat in edges_q.iter_mut() {
         mat.0 = color_default_edge.clone();
     }
 
-    // 2. Подсветка ЗАПЛАНИРОВАННЫХ потоков (FlowMap)
-    // Проходим по всем записям flow_map
+    // 2. Подсветка существующих потоков (без изменений)
     for (source, targets) in &flow_map.flows {
         for &target in targets {
             if let Some(edge_idx) = graph_res.0.find_edge(*source, target) {
@@ -605,7 +614,7 @@ fn update_visuals(
         }
     }
 
-    // 3. Подсветка ПУТИ под курсором (самый высокий приоритет визуала)
+    // 3. Подсветка ПУТИ под курсором (с учетом Shift)
     if !interaction.path.is_empty() {
         for window in interaction.path.windows(2) {
             let u = window[0];
@@ -620,31 +629,7 @@ fn update_visuals(
         }
     }
 
-    // 1. Сброс цветов РЕБЕР в дефолтный (серый)
-    let color_default_edge = materials.add(Color::srgb(0.2, 0.2, 0.2));
-    let color_path_edge = materials.add(Color::srgb(1.0, 1.0, 0.0)); // Желтый путь
-
-    for mut mat in edges_q.iter_mut() {
-        mat.0 = color_default_edge.clone();
-    }
-
-    // 2. Подсветка РЕБЕР пути
-    if !interaction.path.is_empty() {
-        for window in interaction.path.windows(2) {
-            let u = window[0];
-            let v = window[1];
-            if let Some(edge_idx) = graph_res.0.find_edge(u, v) {
-                if let Some(&entity) = entity_map.edges.get(&edge_idx) {
-                    // Теперь это безопасно меняет только ребра
-                    if let Ok(mut mat) = edges_q.get_mut(entity) {
-                        mat.0 = color_path_edge.clone();
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Обновление цветов УЗЛОВ
+    // 4. Узлы (чуть доработаем подсветку пути на узлах тоже)
     for (node, mat_handle) in nodes_q.iter() {
         if let Some(material) = materials.get_mut(mat_handle) {
             let mut base_color = node.owner.color();
@@ -652,7 +637,13 @@ fn update_visuals(
             if Some(node.index) == interaction.selected_source {
                 base_color = Color::WHITE;
             } else if interaction.path.contains(&node.index) {
-                base_color = base_color.mix(&Color::srgb(1.0, 1.0, 0.0), 0.6);
+                // Если мы в режиме удаления, узлы на пути тоже краснеют
+                let tint = if is_erasing {
+                    Color::srgb(1.0, 0.0, 0.0)
+                } else {
+                    Color::srgb(1.0, 1.0, 0.0)
+                };
+                base_color = base_color.mix(&tint, 0.6);
             } else if Some(node.index) == interaction.hovered_node {
                 base_color = base_color.mix(&Color::srgb(1.0, 1.0, 0.0), 0.3);
             }
